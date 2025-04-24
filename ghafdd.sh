@@ -27,11 +27,15 @@ read -s -n 1
  
 echo "You pressed a key! Continuing..."
 sleep 2
-# Old and unsafe method is now replaced
-#DRIVE=$(dmesg |grep -o sd[a-z]: |tail -n1)
-#DRIVE=${DRIVE::-1}
-# New detection method
-DRIVE=$(lsblk -d -n -oNAME,RO | grep '0$' | awk {'print $1'} |grep sd)
+# Find the latest connected usb storage device from dmesg
+DRIVED=$(dmesg |grep -o sd[a-z]: |tail -n1)
+DRIVED=${DRIVED::-1}
+# Now use a better new detection method and cross check it
+# Checking all storage devices that are not internal ssds 
+#DRIVE=$(lsblk -d -n -oNAME,RO | grep '0$' | awk {'print $1'} |grep sd)
+
+# Checking all storage devices with size not 0 and not internal ssds
+DRIVE=$(lsblk -d -n -b -oNAME,SIZE,RO | grep '0$' | awk -v var=$DRIVED '$2 !="0" && $1 == var {print $1}')
 echo $DEVICE
 DRIVE="/dev/"$DRIVE
 DEVICE1=$DRIVE"1"
