@@ -62,7 +62,7 @@ echo "Detected the image file: ${FILE}"
 
 # --- Pre-flight: estimate stream size (kept as in your script) ---
 echo "Checking the required minimum size for USB drive (streaming test)…"
-zstdcat "${FILE}" | pv -b > /dev/null
+zstd -l disk.img.zst | awk 'NR==2 {print $(NF-4), $(NF-3)}'
 
 # --- Prompt to insert USB ---
 echo

@@ -41,8 +41,9 @@ SECTOR_SIZE=512
 ESP_NAME="esp"
 APP_NAME="APP"
 ESP_TYPE="EF00"
-APP_TYPE="8300"
-APP_GUID=""
+APP_TYPE="b921b045-1df0-41c3-af44-4c6f280d3fae" # This is root type
+#APP_TYPE="8300" This was linux-filesystem
+APP_GUID="b921b045-1df0-41c3-af44-4c6f280d3fae"
 KEEP_RAW=0
 SYNC_ESP_TO_ROOT=1
 FIX_ROOT_PROFILE=1
@@ -487,14 +488,14 @@ sgdisk --clear "$DISK_IMG" >/dev/null
 # ESP must be #2; APP must be #1.
 if [[ -n "$APP_GUID" ]]; then
   sgdisk \
-    --new=2:${ESP_START_LBA}:${ESP_END_LBA} --typecode=2:${ESP_TYPE} --change-name=2:"${ESP_NAME}" \
-    --new=1:${APP_START_LBA}:${APP_END_LBA} --typecode=1:${APP_TYPE} --change-name=1:"${APP_NAME}" \
+    --new=1:${ESP_START_LBA}:${ESP_END_LBA} --typecode=1:${ESP_TYPE} --change-name=1:"${ESP_NAME}" \
+    --new=2:${APP_START_LBA}:${APP_END_LBA} --typecode=2:${APP_TYPE} --change-name=2:"${APP_NAME}" \
     --partition-guid=1:"${APP_GUID}" \
     "$DISK_IMG" >/dev/null
 else
   sgdisk \
-    --new=2:${ESP_START_LBA}:${ESP_END_LBA} --typecode=2:${ESP_TYPE} --change-name=2:"${ESP_NAME}" \
-    --new=1:${APP_START_LBA}:${APP_END_LBA} --typecode=1:${APP_TYPE} --change-name=1:"${APP_NAME}" \
+    --new=1:${ESP_START_LBA}:${ESP_END_LBA} --typecode=1:${ESP_TYPE} --change-name=1:"${ESP_NAME}" \
+    --new=2:${APP_START_LBA}:${APP_END_LBA} --typecode=2:${APP_TYPE} --change-name=2:"${APP_NAME}" \
     "$DISK_IMG" >/dev/null
 fi
 
