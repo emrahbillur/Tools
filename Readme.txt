@@ -1,36 +1,41 @@
-port.sh 
+port.sh
 
-is a script that will allow you run a flash script image generation nixos configuration 
-to copy all required items for flashing to a usb image that you can run this flash script in that usb 
-on any linux host to flash a target device. This script copies all required nix store items and creates
-a launcher.sh on your usb to run that flash script.
+Builds a Nix flake app and copies its runtime closure and launcher.sh to a
+destination. The destination may be a local directory or a remote SSH/rsync
+location, so USB storage is optional. Remote destinations require SSH access,
+rsync on the remote host, and write permission for the SSH user.
 
-makediskimage.sh 
+Examples:
+  ./port.sh /mnt/runtime
+  ./port.sh user@host:/srv/runtime
+  ./port.sh --help
 
-is a script that allows merging of esp.img.zst and root.img.zst into a single nixos.img.zst
-with correct partition structure of nixos. Is used inside ghafdd.sh
+launcher.sh
+
+Runs flash-ghaf-host from the copied runtime on a Linux host. Specify the
+directory containing nix/store with --runtime-root, or set RUNTIME_ROOT. If
+launcher.sh is located inside that directory, it can detect the runtime root
+automatically.
+
+Examples:
+  ./launcher.sh --runtime-root=/path/to/runtime
+  ./launcher.sh --runtime-root /path/to/runtime --debug
+  ./launcher.sh --runtime-root=/path/to/runtime -- --flash-option value
+  ./launcher.sh --help
+
+Launcher options are handled by launcher.sh. Other arguments are passed to
+flash-ghaf-host; use -- to explicitly mark the beginning of flash options.
+
+makediskimage.sh
+
+Merges esp.img.zst and root.img.zst into a single nixos.img.zst with the
+expected partition structure. It is used by ghafdd.sh.
 
 ghafdd.sh
- is a script that allows you flash your nixos images onto usb drives where the script checks whether
-the disk image exists or not, also if it is a two seperate image to be merged where it merges 
-automatically and checks for the latest mounted usb and checks the image sized to fit that usb 
-flashes your image to that usb. 
 
+Writes NixOS images to USB drives. It checks image and target sizes, detects
+mounted USB drives, and can merge separate ESP and root images automatically.
 
-RUNNING:
--------------------------------------------------------------------------------------------------------------
-You can add the ghafdd and makediskimage scripts in your nixos configuration like that to have them in your path. 
-Replace /home/emrah/reps/Tools with your script locations.
-
-  environment.systemPackages = with  pkgs; [
-      wget
-    # Personal
-      (pkgs.writeShellScriptBin "ghafdd.sh" ''
-         exec /home/emrah/reps/Tools/ghafdd.sh "$@"
-      '')
-      (pkgs.writeShellScriptBin "makediskimage.sh" ''
-         exec /home/emrah/reps/Tools/makediskimage.sh "$@"
-      '')   
-  ];
-
-For other OS you simply can add it to your PATH
+On NixOS, ghafdd.sh and makediskimage.sh can be added to environment.systemPackages
+with writeShellScriptBin wrappers. On other Linux distributions, add the scripts
+to PATH as needed.

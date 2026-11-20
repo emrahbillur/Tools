@@ -177,7 +177,7 @@ if [[ "$SRC_SZ" -eq 0 || "$DST_SZ" -eq 0 || "$SRC_SZ" -ne "$DST_SZ" ]]; then
 fi
 
 # -----------------------------
-# Fetch launcher.sh from GitHub → USB root
+# Fetch launcher.sh from GitHub → destination
 # -----------------------------
 echo "→ Fetching launcher from GitHub"
 TMP_LAUNCHER="$(mktemp)"
@@ -199,7 +199,7 @@ if ! fetch_to_file "$LAUNCHER_URL" "$TMP_LAUNCHER"; then
   exit 1
 fi
 
-# Install to USB root and make executable
+# Install at destination and make executable
 if (( REMOTE )); then
   rsync -a "$TMP_LAUNCHER" "$REMOTE_HOST:$REMOTE_ROOT/$LAUNCHER_NAME"
   ssh "$REMOTE_HOST" "chmod 755 -- $(remote_shell_quote "$REMOTE_ROOT/$LAUNCHER_NAME")"
@@ -218,4 +218,4 @@ if (( REMOTE )); then
 else
   sudo du -sh "$LOCAL_ROOT/nix/store" | awk '{print "Destination store size:", $1}'
 fi
-echo "   Run on target: $LAUNCHER_NAME --usb-root=/path/to/USB"
+echo "   Run on target: $LAUNCHER_NAME --runtime-root=/path/to/runtime [flash options...]"

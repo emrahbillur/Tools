@@ -1,58 +1,67 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- Locate USB root with nix/store ---
-resolve_usb_root() {
-  if [[ "${1:-}" == --usb-root=* ]]; then echo "${1#--usb-root=}"; return 0; fi
-  if [[ -n "${USB_ROOT:-}" ]]; then echo "$USB_ROOT"; return 0; fi
-  # Script directory (works if launcher lives on the USB)
+# --- Locate runtime root with nix/store ---
+resolve_runtime_root() {
+  if [[ -n "${RUNTIME_ROOT:-}" ]]; then echo "$RUNTIME_ROOT"; return 0; fi
+  # Script directory (works when the launcher is inside the runtime root)
   local d; d="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
   if [[ -d "$d/nix/store" ]]; then echo "$d"; return 0; fi
-  # Common mounts you've used
-  if [[ -d "/media/ghaf/4a6d542b-dd34-4843-b25b-22644ea41060/nix/store" ]]; then
-    echo "/media/ghaf/4a6d542b-dd34-4843-b25b-22644ea41060"; return 0
-  fi
-  if [[ -d "/run/media/emrah/4a6d542b-dd34-4843-b25b-22644ea41060/nix/store" ]]; then
-    echo "/run/media/emrah/4a6d542b-dd34-4843-b25b-22644ea41060"; return 0
-  fi
-  if [[ -d "/run/media/emrah/A54E-0B0B/nix/store" ]]; then
-    echo "/run/media/emrah/A54E-0B0B"; return 0
-  fi
   return 1
 }
 
 # Parse args
 DEBUG="false"
-USB_ROOT=""
-for arg in "$@"; do
-  case "$arg" in
-    --usb-root=*) USB_ROOT="${arg#--usb-root=}";;
-    --debug) DEBUG="true";;
+RUNTIME_ROOT=""
+FLASH_ARGS=()
+usage() {
+  cat <<EOF
+Usage: $0 [--runtime-root=PATH | --runtime-root PATH] [--debug] [--help] [FLASH_OPTION ...]
+
+Mount the runtime's nix/store and run flash-ghaf-host. Options after the
+launcher options are passed unchanged to flash-ghaf-host.
+
+  --runtime-root PATH  Directory containing nix/store (or set RUNTIME_ROOT)
+  --debug              Print launcher diagnostics
+  -h, --help           Show this help
+EOF
+}
+while (($#)); do
+  case "$1" in
+    --runtime-root=*) RUNTIME_ROOT="${1#*=}"; shift ;;
+    --runtime-root)
+      (($# >= 2)) || { echo "--runtime-root requires a path" >&2; exit 2; }
+      RUNTIME_ROOT="$2"; shift 2 ;;
+    --debug) DEBUG="true"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; FLASH_ARGS+=("$@"); break ;;
+    *) FLASH_ARGS+=("$1"); shift ;;
   esac
 done
-if [[ -z "$USB_ROOT" ]]; then
-  USB_ROOT="$(resolve_usb_root "${1:-}")" || {
-    echo "Could not find the USB root with nix/store." >&2
-    echo "Usage: $0 --usb-root=/path/to/USB [--debug]" >&2
+if [[ -z "$RUNTIME_ROOT" ]]; then
+  RUNTIME_ROOT="$(resolve_runtime_root)" || {
+    echo "Could not find a runtime root containing nix/store." >&2
+    echo "Usage: $0 --runtime-root=/path/to/runtime [--debug] [FLASH_OPTION ...]" >&2
     exit 1
   }
 fi
+[[ -d "$RUNTIME_ROOT/nix/store" ]] || { echo "Runtime store not found: $RUNTIME_ROOT/nix/store" >&2; exit 1; }
 
 # Determine exact binary path; prefer recorded file if present
-if [[ -f "$USB_ROOT/.flash-bin-path" ]]; then
-  FLASH_PATH_ABS="$(tr -d '\r\n' < "$USB_ROOT/.flash-bin-path")"
+if [[ -f "$RUNTIME_ROOT/.flash-bin-path" ]]; then
+  FLASH_PATH_ABS="$(tr -d '\r\n' < "$RUNTIME_ROOT/.flash-bin-path")"
 else
   shopt -s nullglob
-  matches=("$USB_ROOT"/nix/store/*-flash-ghaf-host/bin/flash-ghaf-host)
+  matches=("$RUNTIME_ROOT"/nix/store/*-flash-ghaf-host/bin/flash-ghaf-host)
   shopt -u nullglob
-  [[ ${#matches[@]} -gt 0 ]] || { echo "flash-ghaf-host not found on USB"; exit 1; }
+  [[ ${#matches[@]} -gt 0 ]] || { echo "flash-ghaf-host not found in runtime root"; exit 1; }
   FLASH_PATH_ABS="/nix/store/$(basename "$(dirname "${matches[0]}")")/bin/flash-ghaf-host"
 fi
-[[ -x "$USB_ROOT${FLASH_PATH_ABS}" ]] || { echo "Missing: $USB_ROOT${FLASH_PATH_ABS}"; exit 1; }
+[[ -x "$RUNTIME_ROOT${FLASH_PATH_ABS}" ]] || { echo "Missing: $RUNTIME_ROOT${FLASH_PATH_ABS}"; exit 1; }
 
 command -v sudo >/dev/null 2>&1 || { echo "sudo required"; exit 1; }
 
-echo "→ Creating private mount namespace and running $FLASH_PATH_ABS (no args)"
+echo "→ Creating private mount namespace and running $FLASH_PATH_ABS"
 
 # If unshare exists, prefer private mount namespace; otherwise, global mount fallback.
 if command -v unshare >/dev/null 2>&1; then
@@ -60,11 +69,12 @@ if command -v unshare >/dev/null 2>&1; then
   read -r -d '' INNER <<'EOSH' || true
 set -euo pipefail
 
-# Inputs: USB_ROOT, FLASH_PATH_ABS, DEBUG, HOST_PATH
+# Inputs: RUNTIME_ROOT, FLASH_PATH_ABS, DEBUG, HOST_PATH
+FLASH_ARGS=("$@")
 
 # 1) Create /nix and bind the USB's nix (only in this mount ns)
 mkdir -p /nix
-mount --bind "$USB_ROOT/nix" /nix || { echo "ERROR: bind-mount failed"; exit 1; }
+mount --bind "$RUNTIME_ROOT/nix" /nix || { echo "ERROR: bind-mount failed"; exit 1; }
 # 1a) Ensure exec on the bind mount even if USB is 'noexec'
 mount -o remount,bind,exec /nix 2>/dev/null || mount -o remount,exec /nix 2>/dev/null || true
 
@@ -76,7 +86,7 @@ done
 export PATH="${PATH_BUILT}${HOST_PATH:+:$HOST_PATH}"
 
 if [[ "${DEBUG:-false}" == "true" ]]; then
-  echo "DEBUG: USB_ROOT=$USB_ROOT"
+  echo "DEBUG: RUNTIME_ROOT=$RUNTIME_ROOT"
   echo "DEBUG: FLASH_PATH_ABS=$FLASH_PATH_ABS"
   echo "DEBUG: PATH=$PATH"
 fi
@@ -93,16 +103,16 @@ if [[ "$magic" == "#!"* ]]; then
   interpreter="${1:-}"; shift || true
   if [[ -n "$interpreter" && -x "$interpreter" ]]; then
     [[ "$DEBUG" == "true" ]] && echo "DEBUG: Using shebang interpreter: $interpreter $*"
-    exec "$interpreter" "$FLASH_PATH_ABS" "$@"
+    exec "$interpreter" "$FLASH_PATH_ABS" "${FLASH_ARGS[@]}" "$@"
   else
     base="${interpreter##*/}"
     if [[ -n "$base" ]] && command -v "$base" >/dev/null 2>&1; then
       [[ "$DEBUG" == "true" ]] && echo "DEBUG: Shebang interp not on /nix; using host PATH: $base $*"
-      exec "$base" "$FLASH_PATH_ABS" "$@"
+      exec "$base" "$FLASH_PATH_ABS" "${FLASH_ARGS[@]}" "$@"
     else
       if command -v bash >/dev/null 2>&1; then
         [[ "$DEBUG" == "true" ]] && echo "DEBUG: Falling back to 'bash' from host PATH"
-        exec bash "$FLASH_PATH_ABS"
+        exec bash "$FLASH_PATH_ABS" "${FLASH_ARGS[@]}"
       fi
       echo "ERROR: Cannot resolve interpreter for shebang: '$interp'" >&2
       exit 127
@@ -110,19 +120,19 @@ if [[ "$magic" == "#!"* ]]; then
   fi
 else
   [[ "$DEBUG" == "true" ]] && echo "DEBUG: Detected ELF; exec directly"
-  exec "$FLASH_PATH_ABS"
+  exec "$FLASH_PATH_ABS" "${FLASH_ARGS[@]}"
 fi
 EOSH
 
   # Run inner script with environment propagated
-  exec sudo --preserve-env=USB_ROOT,FLASH_PATH_ABS,DEBUG \
-    env USB_ROOT="$USB_ROOT" FLASH_PATH_ABS="$FLASH_PATH_ABS" DEBUG="$DEBUG" HOST_PATH="$PATH" \
-    unshare -m --propagation private bash -c "$INNER"
+  exec sudo --preserve-env=RUNTIME_ROOT,FLASH_PATH_ABS,DEBUG \
+    env RUNTIME_ROOT="$RUNTIME_ROOT" FLASH_PATH_ABS="$FLASH_PATH_ABS" DEBUG="$DEBUG" HOST_PATH="$PATH" \
+    unshare -m --propagation private bash -c "$INNER" launcher-inner "${FLASH_ARGS[@]}"
 else
   # Fallback: global bind mount (safe on non-Nix hosts; avoid on NixOS workstations)
   echo "WARN: 'unshare' not found; using global /nix bind mount (requires sudo)."
   sudo mkdir -p /nix
-  sudo mount --bind "$USB_ROOT/nix" /nix
+  sudo mount --bind "$RUNTIME_ROOT/nix" /nix
   sudo mount -o remount,bind,exec /nix 2>/dev/null || sudo mount -o remount,exec /nix 2>/dev/null || true
   trap 'sudo umount /nix || true' EXIT
 
@@ -133,5 +143,5 @@ else
   done
   export PATH="${PATH_BUILT}:$PATH"
 
-  exec "$FLASH_PATH_ABS"
+  exec "$FLASH_PATH_ABS" "${FLASH_ARGS[@]}"
 fi
