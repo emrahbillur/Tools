@@ -4,7 +4,7 @@ set -euo pipefail
 # -----------------------------
 # Config / Defaults
 # -----------------------------
-DEFAULT_USB="/run/media/emrah/4a6d542b-dd34-4843-b25b-22644ea41060"
+DEFAULT_DESTINATION="/run/media/emrah/4a6d542b-dd34-4843-b25b-22644ea41060"
 DEFAULT_APP_ATTR="#nvidia-jetson-orin-nx-release-nodemoapps-from-x86_64-flash-qspi-salukiv3"
 
 # Where to fetch the launcher from (you can override via env LAUNCHER_URL)
@@ -14,12 +14,64 @@ LAUNCHER_NAME="${LAUNCHER_NAME:-launcher.sh}"
 # -----------------------------
 # Args
 # -----------------------------
-USB_ROOT="${1:-$DEFAULT_USB}"
+usage() {
+  cat <<'EOF'
+Usage: port.sh [--help] [DESTINATION] [APP_ATTR]
+
+Build APP_ATTR, copy its runtime closure and launcher to DESTINATION, and
+verify the copied flash binary. DESTINATION can be a local directory or an
+rsync/SSH destination such as user@host:/path/to/target. Remote destinations
+must be writable by the SSH user and have rsync installed.
+
+Arguments:
+  DESTINATION  Local directory or user@host:/absolute/path
+               (default: /run/media/emrah/4a6d542b-dd34-4843-b25b-22644ea41060)
+  APP_ATTR     Nix flake installable attribute (default: the configured Jetson
+               release attribute)
+
+Environment:
+  LAUNCHER_URL   Launcher URL to install
+  LAUNCHER_NAME  Launcher filename (default: launcher.sh)
+
+Examples:
+  port.sh /run/media/$USER/USB
+  port.sh emrah@target:/tmp/flash-kit
+  port.sh /mnt/usb '#nixosConfigurations.host.config.system.build.toplevel'
+EOF
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  exit 0
+fi
+
+DESTINATION="${1:-$DEFAULT_DESTINATION}"
 APP_ATTR="${2:-$DEFAULT_APP_ATTR}"
+if [[ $# -gt 2 ]]; then
+  echo "Unexpected extra argument: ${@:3}" >&2
+  usage >&2
+  exit 2
+fi
 
-sudo test -d "$USB_ROOT" || { echo "USB root not found: $USB_ROOT" >&2; exit 1; }
+# rsync's host:path form identifies an SSH destination. Local paths can
+# contain colons after a slash, so only recognize the conventional host:path
+# form where the colon precedes any slash.
+if [[ "$DESTINATION" =~ ^([^/:]+@[^/:]+|[^/:]+):(.+)$ ]]; then
+  REMOTE_HOST="${BASH_REMATCH[1]}"
+  REMOTE_ROOT="${BASH_REMATCH[2]}"
+  REMOTE=1
+else
+  LOCAL_ROOT="$DESTINATION"
+  REMOTE=0
+fi
 
-echo "→ USB_ROOT : $USB_ROOT"
+if (( REMOTE )); then
+  [[ "$REMOTE_ROOT" == /* ]] || { echo "Remote destination must be an absolute path: $DESTINATION" >&2; exit 2; }
+else
+  sudo mkdir -p "$LOCAL_ROOT"
+fi
+
+echo "→ DESTINATION : $DESTINATION"
 echo "→ APP_ATTR : $APP_ATTR"
 echo "→ LAUNCHER : $LAUNCHER_URL -> $LAUNCHER_NAME"
 
@@ -64,43 +116,61 @@ fi
 # -----------------------------
 # Copy the closure reliably
 # -----------------------------
-echo "→ Copying closure to $USB_ROOT with rsync --relative (preserves links/metadata)"
-sudo mkdir -p "$USB_ROOT/nix/store"
+echo "→ Copying closure to $DESTINATION with rsync --relative (preserves links/metadata)"
+remote_shell_quote() { printf "'%s'" "${1//\'/'\\''}"; }
+if (( REMOTE )); then
+  ssh "$REMOTE_HOST" "mkdir -p -- $(remote_shell_quote "$REMOTE_ROOT/nix/store")"
+  RSYNC_DEST="$REMOTE_HOST:$REMOTE_ROOT/"
+else
+  sudo mkdir -p "$LOCAL_ROOT/nix/store"
+fi
 
 # Remove any previous partial tree for main derivation to avoid stale zero-size files
-sudo rm -rf "$USB_ROOT$FLASH_OUT" || true
+if (( REMOTE )); then
+  ssh "$REMOTE_HOST" "rm -rf -- $(remote_shell_quote "$REMOTE_ROOT$FLASH_OUT")"
+else
+  sudo rm -rf "$LOCAL_ROOT$FLASH_OUT" || true
+fi
 
 for p in "${CLOSURE[@]}"; do
   if [[ -d "$p" ]]; then
     # Directory: copy contents (trailing slash) and recreate full path
-    sudo rsync -aH --relative "$p/" "$USB_ROOT/"
+    if (( REMOTE )); then rsync -aH --relative "$p/" "$RSYNC_DEST"; else sudo rsync -aH --relative "$p/" "$LOCAL_ROOT/"; fi
   else
     # File: copy as-is, recreating the full path
-    sudo rsync -aH --relative "$p" "$USB_ROOT/"
+    if (( REMOTE )); then rsync -aH --relative "$p" "$RSYNC_DEST"; else sudo rsync -aH --relative "$p" "$LOCAL_ROOT/"; fi
   fi
 done
 # -----------------------------
 # Record the exact binary path for the launcher (NO trailing newline)
 # -----------------------------
 FLASH_BIN_ABS="/nix/store/$(basename "$FLASH_OUT")/bin/flash-ghaf-host"
-printf '%s' "$FLASH_BIN_ABS" | sudo tee "$USB_ROOT/.flash-bin-path" >/dev/null
-echo "→ Recorded flash binary path at $USB_ROOT/.flash-bin-path"
+if (( REMOTE )); then
+  printf '%s' "$FLASH_BIN_ABS" | ssh "$REMOTE_HOST" "cat > $(remote_shell_quote "$REMOTE_ROOT/.flash-bin-path")"
+else
+  printf '%s' "$FLASH_BIN_ABS" | sudo tee "$LOCAL_ROOT/.flash-bin-path" >/dev/null
+fi
+echo "→ Recorded flash binary path at $DESTINATION/.flash-bin-path"
 
 # Verify sizes (source vs destination)
 SRC_BIN="$FLASH_OUT/bin/flash-ghaf-host"
-DST_BIN="$USB_ROOT$FLASH_BIN_ABS"
 if [[ ! -f "$SRC_BIN" ]]; then
   echo "ERROR: Source binary missing: $SRC_BIN" >&2
   exit 1
 fi
-if [[ ! -f "$DST_BIN" ]]; then
-  echo "ERROR: Destination binary missing: $DST_BIN" >&2
-  exit 1
-fi
 SRC_SZ="$(stat -c '%s' "$SRC_BIN")"
-DST_SZ="$(stat -c '%s' "$DST_BIN")"
+if (( REMOTE )); then
+  DST_SZ="$(ssh "$REMOTE_HOST" "stat -c %s -- $(remote_shell_quote "$REMOTE_ROOT$FLASH_BIN_ABS")")"
+else
+  DST_BIN="$LOCAL_ROOT$FLASH_BIN_ABS"
+  if [[ ! -f "$DST_BIN" ]]; then
+    echo "ERROR: Destination binary missing: $DST_BIN" >&2
+    exit 1
+  fi
+  DST_SZ="$(stat -c '%s' "$DST_BIN")"
+fi
 echo "   Source size: $SRC_SZ bytes"
-echo "   USB size   : $DST_SZ bytes"
+echo "   Destination size: $DST_SZ bytes"
 if [[ "$SRC_SZ" -eq 0 || "$DST_SZ" -eq 0 || "$SRC_SZ" -ne "$DST_SZ" ]]; then
   echo "ERROR: Size mismatch or zero-byte copy; copy failed. Aborting." >&2
   exit 1
@@ -130,13 +200,22 @@ if ! fetch_to_file "$LAUNCHER_URL" "$TMP_LAUNCHER"; then
 fi
 
 # Install to USB root and make executable
-sudo install -Dm755 "$TMP_LAUNCHER" "$USB_ROOT/$LAUNCHER_NAME"
+if (( REMOTE )); then
+  rsync -a "$TMP_LAUNCHER" "$REMOTE_HOST:$REMOTE_ROOT/$LAUNCHER_NAME"
+  ssh "$REMOTE_HOST" "chmod 755 -- $(remote_shell_quote "$REMOTE_ROOT/$LAUNCHER_NAME")"
+else
+  sudo install -Dm755 "$TMP_LAUNCHER" "$LOCAL_ROOT/$LAUNCHER_NAME"
+fi
 rm -f "$TMP_LAUNCHER"
-echo "→ Placed $LAUNCHER_NAME at $USB_ROOT/$LAUNCHER_NAME (executable)"
+echo "→ Placed $LAUNCHER_NAME at $DESTINATION/$LAUNCHER_NAME (executable)"
 
 # -----------------------------
 # Finish
 # -----------------------------
 echo "✅ Done."
-sudo du -sh "$USB_ROOT/nix/store" | awk '{print "USB store size:", $1}'
+if (( REMOTE )); then
+  ssh "$REMOTE_HOST" "du -sh -- $(remote_shell_quote "$REMOTE_ROOT/nix/store")" | awk '{print "Destination store size:", $1}'
+else
+  sudo du -sh "$LOCAL_ROOT/nix/store" | awk '{print "Destination store size:", $1}'
+fi
 echo "   Run on target: $LAUNCHER_NAME --usb-root=/path/to/USB"
