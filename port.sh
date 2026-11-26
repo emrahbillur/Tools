@@ -5,9 +5,10 @@ set -euo pipefail
 # Config / Defaults
 # -----------------------------
 DEFAULT_DESTINATION="/run/media/emrah/4a6d542b-dd34-4843-b25b-22644ea41060"
-DEFAULT_APP_ATTR="#nvidia-jetson-orin-nx-release-nodemoapps-from-x86_64-flash-qspi-salukiv3"
+DEFAULT_APP_ATTR="#nvidia-jetson-orin-nx-debug-from-x86_64-flash-qspi"
 
-# Where to fetch the launcher from (you can override via env LAUNCHER_URL)
+# Set LAUNCHER_URL to fetch a launcher instead of using the local copy.
+: "${LAUNCHER_URL_OVERRIDE:=${LAUNCHER_URL:-}}"
 : "${LAUNCHER_URL:=https://raw.githubusercontent.com/emrahbillur/Tools/main/launcher.sh}"
 LAUNCHER_NAME="${LAUNCHER_NAME:-launcher.sh}"
 
@@ -24,7 +25,7 @@ rsync/SSH destination such as user@host:/path/to/target. Remote destinations
 must be writable by the SSH user and have rsync installed.
 
 Arguments:
-  -tar         Write the runtime to a tar archive; install launcher beside it
+  -tar         Write a gzip-compressed tar archive; install launcher beside it
   DESTINATION  Local directory or user@host:/absolute/path
                (default: /run/media/emrah/4a6d542b-dd34-4843-b25b-22644ea41060)
   APP_ATTR     Nix flake installable attribute (default: the configured Jetson
@@ -38,7 +39,7 @@ Examples:
   port.sh /run/media/$USER/USB
   port.sh emrah@target:/tmp/flash-kit
   port.sh /mnt/usb '#nixosConfigurations.host.config.system.build.toplevel'
-  port.sh -tar /mnt/usb/flash-runtime.tar
+  port.sh -tar /mnt/usb/flash-runtime.tar.gz
 EOF
 }
 
@@ -77,15 +78,29 @@ if (( TAR_MODE )); then
   if (( REMOTE )); then
     REMOTE_ARCHIVE="$REMOTE_ROOT"
     REMOTE_ROOT="$(dirname -- "$REMOTE_ARCHIVE")"
-    [[ "$REMOTE_ARCHIVE" == *.tar || "$REMOTE_ARCHIVE" == *.tar.gz || "$REMOTE_ARCHIVE" == *.tgz ]] || REMOTE_ARCHIVE="$REMOTE_ARCHIVE.tar"
+    case "$REMOTE_ARCHIVE" in
+      *.tar.gz|*.tgz) ;;
+      *.tar) REMOTE_ARCHIVE="${REMOTE_ARCHIVE%.tar}.tar.gz" ;;
+      *) REMOTE_ARCHIVE="$REMOTE_ARCHIVE.tar.gz" ;;
+    esac
     REMOTE_LAUNCHER="$REMOTE_ROOT/$LAUNCHER_NAME"
   else
     LOCAL_ARCHIVE="$LOCAL_ROOT"
     LOCAL_ROOT="$(dirname -- "$LOCAL_ARCHIVE")"
-    [[ "$LOCAL_ARCHIVE" == *.tar || "$LOCAL_ARCHIVE" == *.tar.gz || "$LOCAL_ARCHIVE" == *.tgz ]] || LOCAL_ARCHIVE="$LOCAL_ARCHIVE.tar"
+    case "$LOCAL_ARCHIVE" in
+      *.tar.gz|*.tgz) ;;
+      *.tar) LOCAL_ARCHIVE="${LOCAL_ARCHIVE%.tar}.tar.gz" ;;
+      *) LOCAL_ARCHIVE="$LOCAL_ARCHIVE.tar.gz" ;;
+    esac
     REMOTE_LAUNCHER=""
   fi
   TAR_STAGE="$(mktemp -d)"
+  cleanup_tar_stage() {
+    [[ -n "${TAR_STAGE:-}" && -d "$TAR_STAGE" ]] || return 0
+    chmod -R u+w -- "$TAR_STAGE" 2>/dev/null || true
+    rm -rf -- "$TAR_STAGE"
+  }
+  trap cleanup_tar_stage EXIT
   LOCAL_ROOT="$TAR_STAGE/runtime"
   mkdir -p "$LOCAL_ROOT"
 fi
@@ -98,7 +113,11 @@ fi
 
 echo "→ DESTINATION : $DESTINATION"
 echo "→ APP_ATTR : $APP_ATTR"
-echo "→ LAUNCHER : $LAUNCHER_URL -> $LAUNCHER_NAME"
+if [[ -n "$LAUNCHER_URL_OVERRIDE" ]]; then
+  echo "→ LAUNCHER : $LAUNCHER_URL_OVERRIDE -> $LAUNCHER_NAME"
+else
+  echo "→ LAUNCHER : local copy -> $LAUNCHER_NAME"
+fi
 
 # -----------------------------
 # Build the app
@@ -142,7 +161,11 @@ fi
 # Copy the closure reliably
 # -----------------------------
 echo "→ Copying closure to $DESTINATION with rsync --relative (preserves links/metadata)"
-remote_shell_quote() { printf "'%s'" "${1//\'/'\\''}"; }
+remote_shell_quote() {
+  local quoted
+  printf -v quoted '%q' "$1"
+  printf '%s' "$quoted"
+}
 if (( REMOTE && ! TAR_MODE )); then
   ssh "$REMOTE_HOST" "mkdir -p -- $(remote_shell_quote "$REMOTE_ROOT/nix/store")"
   RSYNC_DEST="$REMOTE_HOST:$REMOTE_ROOT/"
@@ -179,7 +202,11 @@ else
     printf '%s' "$FLASH_BIN_ABS" | sudo tee "$LOCAL_ROOT/.flash-bin-path" >/dev/null
   fi
 fi
-echo "→ Recorded flash binary path at $DESTINATION/.flash-bin-path"
+if (( TAR_MODE )); then
+  echo "→ Recorded flash binary path in staged runtime"
+else
+  echo "→ Recorded flash binary path at $DESTINATION/.flash-bin-path"
+fi
 
 # Verify sizes (source vs destination)
 SRC_BIN="$FLASH_OUT/bin/flash-ghaf-host"
@@ -208,7 +235,7 @@ fi
 # -----------------------------
 # Fetch launcher.sh from GitHub → destination
 # -----------------------------
-echo "→ Fetching launcher from GitHub"
+echo "→ Preparing launcher"
 TMP_LAUNCHER="$(mktemp)"
 fetch_to_file() {
   local url="$1" dest="$2"
@@ -223,7 +250,16 @@ fetch_to_file() {
     "$CURL_OUT/bin/curl" -fsSL "$url" -o "$dest"
   fi
 }
-if ! fetch_to_file "$LAUNCHER_URL" "$TMP_LAUNCHER"; then
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+LOCAL_LAUNCHER="$SCRIPT_DIR/launcher.sh"
+if [[ -n "$LAUNCHER_URL_OVERRIDE" ]]; then
+  if ! fetch_to_file "$LAUNCHER_URL_OVERRIDE" "$TMP_LAUNCHER"; then
+    echo "ERROR: Failed to download launcher from $LAUNCHER_URL_OVERRIDE" >&2
+    exit 1
+  fi
+elif [[ -f "$LOCAL_LAUNCHER" ]]; then
+  cp -- "$LOCAL_LAUNCHER" "$TMP_LAUNCHER"
+elif ! fetch_to_file "$LAUNCHER_URL" "$TMP_LAUNCHER"; then
   echo "ERROR: Failed to download launcher from $LAUNCHER_URL" >&2
   exit 1
 fi
@@ -239,24 +275,25 @@ if (( TAR_MODE )); then
   install -Dm755 "$TMP_LAUNCHER" "$LOCAL_ROOT/$LAUNCHER_NAME"
   if [[ "$LOCAL_ARCHIVE" != "" ]]; then
     mkdir -p "$(dirname -- "$LOCAL_ARCHIVE")"
-    case "$LOCAL_ARCHIVE" in
-      *.tar.gz|*.tgz) tar -C "$LOCAL_ROOT" -czf "$LOCAL_ARCHIVE" . ;;
-      *) tar -C "$LOCAL_ROOT" -cf "$LOCAL_ARCHIVE" . ;;
-    esac
+    tar -C "$LOCAL_ROOT" -czf "$LOCAL_ARCHIVE" .
     install -Dm755 "$TMP_LAUNCHER" "$(dirname -- "$LOCAL_ARCHIVE")/$LAUNCHER_NAME"
   else
     ssh "$REMOTE_HOST" "mkdir -p -- $(remote_shell_quote "$REMOTE_ROOT")"
-    case "$REMOTE_ARCHIVE" in
-      *.tar.gz|*.tgz) tar -C "$LOCAL_ROOT" -czf - . | ssh "$REMOTE_HOST" "cat > $(remote_shell_quote "$REMOTE_ARCHIVE")" ;;
-      *) tar -C "$LOCAL_ROOT" -cf - . | ssh "$REMOTE_HOST" "cat > $(remote_shell_quote "$REMOTE_ARCHIVE")" ;;
-    esac
+    tar -C "$LOCAL_ROOT" -czf - . | ssh "$REMOTE_HOST" "cat > $(remote_shell_quote "$REMOTE_ARCHIVE")"
     rsync -a "$TMP_LAUNCHER" "$REMOTE_HOST:$REMOTE_LAUNCHER"
     ssh "$REMOTE_HOST" "chmod 755 -- $(remote_shell_quote "$REMOTE_LAUNCHER")"
   fi
-  rm -rf "$TAR_STAGE"
 fi
 rm -f "$TMP_LAUNCHER"
-echo "→ Placed $LAUNCHER_NAME at $DESTINATION/$LAUNCHER_NAME (executable)"
+if (( TAR_MODE )); then
+  if (( REMOTE )); then
+    echo "→ Placed $LAUNCHER_NAME at $REMOTE_LAUNCHER (executable)"
+  else
+    echo "→ Placed $LAUNCHER_NAME at $(dirname -- "$LOCAL_ARCHIVE")/$LAUNCHER_NAME (executable)"
+  fi
+else
+  echo "→ Placed $LAUNCHER_NAME at $DESTINATION/$LAUNCHER_NAME (executable)"
+fi
 
 # -----------------------------
 # Finish

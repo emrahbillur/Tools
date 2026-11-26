@@ -67,7 +67,11 @@ if [[ -z "$RUNTIME_ROOT" ]]; then
   }
 fi
 if [[ "$ARCHIVE_MODE" == "true" ]]; then
-  trap 'rm -rf -- "$RUNTIME_ROOT"' EXIT
+  cleanup_runtime() {
+    chmod -R u+w -- "$RUNTIME_ROOT" 2>/dev/null || true
+    rm -rf -- "$RUNTIME_ROOT"
+  }
+  trap cleanup_runtime EXIT
 fi
 [[ -d "$RUNTIME_ROOT/nix/store" ]] || { echo "Runtime store not found: $RUNTIME_ROOT/nix/store" >&2; exit 1; }
 
