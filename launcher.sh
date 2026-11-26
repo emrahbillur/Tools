@@ -13,6 +13,7 @@ resolve_runtime_root() {
 # Parse args
 DEBUG="false"
 RUNTIME_ROOT=""
+ARCHIVE_MODE="false"
 FLASH_ARGS=()
 usage() {
   cat <<EOF
@@ -39,11 +40,34 @@ while (($#)); do
   esac
 done
 if [[ -z "$RUNTIME_ROOT" ]]; then
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  shopt -s nullglob
+  archives=("$SCRIPT_DIR"/*.tar "$SCRIPT_DIR"/*.tar.gz "$SCRIPT_DIR"/*.tgz)
+  shopt -u nullglob
+  if ((${#archives[@]} == 1)); then
+    candidate="${archives[0]}"
+    if [[ -f "$candidate" ]]; then
+      RUNTIME_ROOT="$(mktemp -d)"
+      ARCHIVE_MODE="true"
+      case "$candidate" in
+        *.tar.gz|*.tgz) tar -xzf "$candidate" -C "$RUNTIME_ROOT" ;;
+        *) tar -xf "$candidate" -C "$RUNTIME_ROOT" ;;
+      esac
+    fi
+  elif ((${#archives[@]} > 1)); then
+    echo "Multiple runtime archives beside launcher; use --runtime-root after extracting one." >&2
+    exit 1
+  fi
+fi
+if [[ -z "$RUNTIME_ROOT" ]]; then
   RUNTIME_ROOT="$(resolve_runtime_root)" || {
     echo "Could not find a runtime root containing nix/store." >&2
     echo "Usage: $0 --runtime-root=/path/to/runtime [--debug] [FLASH_OPTION ...]" >&2
     exit 1
   }
+fi
+if [[ "$ARCHIVE_MODE" == "true" ]]; then
+  trap 'rm -rf -- "$RUNTIME_ROOT"' EXIT
 fi
 [[ -d "$RUNTIME_ROOT/nix/store" ]] || { echo "Runtime store not found: $RUNTIME_ROOT/nix/store" >&2; exit 1; }
 
@@ -125,7 +149,7 @@ fi
 EOSH
 
   # Run inner script with environment propagated
-  exec sudo --preserve-env=RUNTIME_ROOT,FLASH_PATH_ABS,DEBUG \
+  sudo --preserve-env=RUNTIME_ROOT,FLASH_PATH_ABS,DEBUG \
     env RUNTIME_ROOT="$RUNTIME_ROOT" FLASH_PATH_ABS="$FLASH_PATH_ABS" DEBUG="$DEBUG" HOST_PATH="$PATH" \
     unshare -m --propagation private bash -c "$INNER" launcher-inner "${FLASH_ARGS[@]}"
 else
@@ -143,5 +167,5 @@ else
   done
   export PATH="${PATH_BUILT}:$PATH"
 
-  exec "$FLASH_PATH_ABS" "${FLASH_ARGS[@]}"
+  "$FLASH_PATH_ABS" "${FLASH_ARGS[@]}"
 fi

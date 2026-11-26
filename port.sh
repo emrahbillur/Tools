@@ -16,7 +16,7 @@ LAUNCHER_NAME="${LAUNCHER_NAME:-launcher.sh}"
 # -----------------------------
 usage() {
   cat <<'EOF'
-Usage: port.sh [--help] [DESTINATION] [APP_ATTR]
+Usage: port.sh [--help] [-tar] [DESTINATION] [APP_ATTR]
 
 Build APP_ATTR, copy its runtime closure and launcher to DESTINATION, and
 verify the copied flash binary. DESTINATION can be a local directory or an
@@ -24,6 +24,7 @@ rsync/SSH destination such as user@host:/path/to/target. Remote destinations
 must be writable by the SSH user and have rsync installed.
 
 Arguments:
+  -tar         Write the runtime to a tar archive; install launcher beside it
   DESTINATION  Local directory or user@host:/absolute/path
                (default: /run/media/emrah/4a6d542b-dd34-4843-b25b-22644ea41060)
   APP_ATTR     Nix flake installable attribute (default: the configured Jetson
@@ -37,6 +38,7 @@ Examples:
   port.sh /run/media/$USER/USB
   port.sh emrah@target:/tmp/flash-kit
   port.sh /mnt/usb '#nixosConfigurations.host.config.system.build.toplevel'
+  port.sh -tar /mnt/usb/flash-runtime.tar
 EOF
 }
 
@@ -45,6 +47,12 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   exit 0
 fi
 
+TAR_MODE=0
+LOCAL_ARCHIVE=""
+if [[ "${1:-}" == "-tar" ]]; then
+  TAR_MODE=1
+  shift
+fi
 DESTINATION="${1:-$DEFAULT_DESTINATION}"
 APP_ATTR="${2:-$DEFAULT_APP_ATTR}"
 if [[ $# -gt 2 ]]; then
@@ -65,10 +73,27 @@ else
   REMOTE=0
 fi
 
+if (( TAR_MODE )); then
+  if (( REMOTE )); then
+    REMOTE_ARCHIVE="$REMOTE_ROOT"
+    REMOTE_ROOT="$(dirname -- "$REMOTE_ARCHIVE")"
+    [[ "$REMOTE_ARCHIVE" == *.tar || "$REMOTE_ARCHIVE" == *.tar.gz || "$REMOTE_ARCHIVE" == *.tgz ]] || REMOTE_ARCHIVE="$REMOTE_ARCHIVE.tar"
+    REMOTE_LAUNCHER="$REMOTE_ROOT/$LAUNCHER_NAME"
+  else
+    LOCAL_ARCHIVE="$LOCAL_ROOT"
+    LOCAL_ROOT="$(dirname -- "$LOCAL_ARCHIVE")"
+    [[ "$LOCAL_ARCHIVE" == *.tar || "$LOCAL_ARCHIVE" == *.tar.gz || "$LOCAL_ARCHIVE" == *.tgz ]] || LOCAL_ARCHIVE="$LOCAL_ARCHIVE.tar"
+    REMOTE_LAUNCHER=""
+  fi
+  TAR_STAGE="$(mktemp -d)"
+  LOCAL_ROOT="$TAR_STAGE/runtime"
+  mkdir -p "$LOCAL_ROOT"
+fi
+
 if (( REMOTE )); then
   [[ "$REMOTE_ROOT" == /* ]] || { echo "Remote destination must be an absolute path: $DESTINATION" >&2; exit 2; }
 else
-  sudo mkdir -p "$LOCAL_ROOT"
+  if (( ! TAR_MODE )); then sudo mkdir -p "$LOCAL_ROOT"; fi
 fi
 
 echo "→ DESTINATION : $DESTINATION"
@@ -118,37 +143,41 @@ fi
 # -----------------------------
 echo "→ Copying closure to $DESTINATION with rsync --relative (preserves links/metadata)"
 remote_shell_quote() { printf "'%s'" "${1//\'/'\\''}"; }
-if (( REMOTE )); then
+if (( REMOTE && ! TAR_MODE )); then
   ssh "$REMOTE_HOST" "mkdir -p -- $(remote_shell_quote "$REMOTE_ROOT/nix/store")"
   RSYNC_DEST="$REMOTE_HOST:$REMOTE_ROOT/"
-else
+elif (( ! TAR_MODE )); then
   sudo mkdir -p "$LOCAL_ROOT/nix/store"
 fi
 
 # Remove any previous partial tree for main derivation to avoid stale zero-size files
-if (( REMOTE )); then
+if (( REMOTE && ! TAR_MODE )); then
   ssh "$REMOTE_HOST" "rm -rf -- $(remote_shell_quote "$REMOTE_ROOT$FLASH_OUT")"
-else
+elif (( ! TAR_MODE )); then
   sudo rm -rf "$LOCAL_ROOT$FLASH_OUT" || true
 fi
 
 for p in "${CLOSURE[@]}"; do
   if [[ -d "$p" ]]; then
     # Directory: copy contents (trailing slash) and recreate full path
-    if (( REMOTE )); then rsync -aH --relative "$p/" "$RSYNC_DEST"; else sudo rsync -aH --relative "$p/" "$LOCAL_ROOT/"; fi
+    if (( REMOTE && ! TAR_MODE )); then rsync -aH --relative "$p/" "$RSYNC_DEST"; else if (( TAR_MODE )); then rsync -aH --relative "$p/" "$LOCAL_ROOT/"; else sudo rsync -aH --relative "$p/" "$LOCAL_ROOT/"; fi; fi
   else
     # File: copy as-is, recreating the full path
-    if (( REMOTE )); then rsync -aH --relative "$p" "$RSYNC_DEST"; else sudo rsync -aH --relative "$p" "$LOCAL_ROOT/"; fi
+    if (( REMOTE && ! TAR_MODE )); then rsync -aH --relative "$p" "$RSYNC_DEST"; else if (( TAR_MODE )); then rsync -aH --relative "$p" "$LOCAL_ROOT/"; else sudo rsync -aH --relative "$p" "$LOCAL_ROOT/"; fi; fi
   fi
 done
 # -----------------------------
 # Record the exact binary path for the launcher (NO trailing newline)
 # -----------------------------
 FLASH_BIN_ABS="/nix/store/$(basename "$FLASH_OUT")/bin/flash-ghaf-host"
-if (( REMOTE )); then
+if (( REMOTE && ! TAR_MODE )); then
   printf '%s' "$FLASH_BIN_ABS" | ssh "$REMOTE_HOST" "cat > $(remote_shell_quote "$REMOTE_ROOT/.flash-bin-path")"
 else
-  printf '%s' "$FLASH_BIN_ABS" | sudo tee "$LOCAL_ROOT/.flash-bin-path" >/dev/null
+  if (( TAR_MODE )); then
+    printf '%s' "$FLASH_BIN_ABS" > "$LOCAL_ROOT/.flash-bin-path"
+  else
+    printf '%s' "$FLASH_BIN_ABS" | sudo tee "$LOCAL_ROOT/.flash-bin-path" >/dev/null
+  fi
 fi
 echo "→ Recorded flash binary path at $DESTINATION/.flash-bin-path"
 
@@ -159,7 +188,7 @@ if [[ ! -f "$SRC_BIN" ]]; then
   exit 1
 fi
 SRC_SZ="$(stat -c '%s' "$SRC_BIN")"
-if (( REMOTE )); then
+if (( REMOTE && ! TAR_MODE )); then
   DST_SZ="$(ssh "$REMOTE_HOST" "stat -c %s -- $(remote_shell_quote "$REMOTE_ROOT$FLASH_BIN_ABS")")"
 else
   DST_BIN="$LOCAL_ROOT$FLASH_BIN_ABS"
@@ -200,11 +229,31 @@ if ! fetch_to_file "$LAUNCHER_URL" "$TMP_LAUNCHER"; then
 fi
 
 # Install at destination and make executable
-if (( REMOTE )); then
+if (( REMOTE && ! TAR_MODE )); then
   rsync -a "$TMP_LAUNCHER" "$REMOTE_HOST:$REMOTE_ROOT/$LAUNCHER_NAME"
   ssh "$REMOTE_HOST" "chmod 755 -- $(remote_shell_quote "$REMOTE_ROOT/$LAUNCHER_NAME")"
-else
+elif (( ! TAR_MODE )); then
   sudo install -Dm755 "$TMP_LAUNCHER" "$LOCAL_ROOT/$LAUNCHER_NAME"
+fi
+if (( TAR_MODE )); then
+  install -Dm755 "$TMP_LAUNCHER" "$LOCAL_ROOT/$LAUNCHER_NAME"
+  if [[ "$LOCAL_ARCHIVE" != "" ]]; then
+    mkdir -p "$(dirname -- "$LOCAL_ARCHIVE")"
+    case "$LOCAL_ARCHIVE" in
+      *.tar.gz|*.tgz) tar -C "$LOCAL_ROOT" -czf "$LOCAL_ARCHIVE" . ;;
+      *) tar -C "$LOCAL_ROOT" -cf "$LOCAL_ARCHIVE" . ;;
+    esac
+    install -Dm755 "$TMP_LAUNCHER" "$(dirname -- "$LOCAL_ARCHIVE")/$LAUNCHER_NAME"
+  else
+    ssh "$REMOTE_HOST" "mkdir -p -- $(remote_shell_quote "$REMOTE_ROOT")"
+    case "$REMOTE_ARCHIVE" in
+      *.tar.gz|*.tgz) tar -C "$LOCAL_ROOT" -czf - . | ssh "$REMOTE_HOST" "cat > $(remote_shell_quote "$REMOTE_ARCHIVE")" ;;
+      *) tar -C "$LOCAL_ROOT" -cf - . | ssh "$REMOTE_HOST" "cat > $(remote_shell_quote "$REMOTE_ARCHIVE")" ;;
+    esac
+    rsync -a "$TMP_LAUNCHER" "$REMOTE_HOST:$REMOTE_LAUNCHER"
+    ssh "$REMOTE_HOST" "chmod 755 -- $(remote_shell_quote "$REMOTE_LAUNCHER")"
+  fi
+  rm -rf "$TAR_STAGE"
 fi
 rm -f "$TMP_LAUNCHER"
 echo "→ Placed $LAUNCHER_NAME at $DESTINATION/$LAUNCHER_NAME (executable)"
@@ -212,7 +261,16 @@ echo "→ Placed $LAUNCHER_NAME at $DESTINATION/$LAUNCHER_NAME (executable)"
 # -----------------------------
 # Finish
 # -----------------------------
-echo "✅ Done."
+echo "Completed."
+if (( TAR_MODE )); then
+  if (( REMOTE )); then
+    echo "   Archive: $DESTINATION"
+  else
+    echo "   Archive: $LOCAL_ARCHIVE"
+  fi
+  echo "   Run beside the archive: $LAUNCHER_NAME [flash options...]"
+  exit 0
+fi
 if (( REMOTE )); then
   ssh "$REMOTE_HOST" "du -sh -- $(remote_shell_quote "$REMOTE_ROOT/nix/store")" | awk '{print "Destination store size:", $1}'
 else

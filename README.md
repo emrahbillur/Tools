@@ -16,6 +16,9 @@ USB drive, another mounted disk, or a remote Linux host.
 # Remote directory (SSH access and remote rsync required)
 ./port.sh user@host:/srv/runtime
 
+# Package the runtime in a tar archive, with launcher.sh beside it
+./port.sh -tar /mnt/usb/flash-runtime.tar
+
 # Choose a different Nix flake attribute
 ./port.sh /mnt/runtime '#nixosConfigurations.host.config.system.build.toplevel'
 
@@ -27,6 +30,12 @@ The remote SSH user must be able to write to the destination. `port.sh` builds
 the requested attribute plus the Bash, coreutils, and util-linux closures,
 copies them under `nix/store`, downloads the launcher, and checks the copied
 flash binary.
+
+With `-tar`, DESTINATION is the archive file path (local or `user@host:path`).
+The launcher is placed in the same directory. When run there without an
+explicit runtime root, it extracts the sole `.tar`, `.tar.gz`, or `.tgz`
+archive beside it into a temporary directory, runs the flash program, and
+removes the temporary runtime when it exits.
 
 ## `launcher.sh`
 
